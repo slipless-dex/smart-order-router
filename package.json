@@ -1,0 +1,48 @@
+{
+  "name": "@slipless/smart-order-router",
+  "version": "0.1.0",
+  "description": "Smart-order router for Slipless. Finds the best path across V2-style, V3-style, and perp pools, splits across routes, and gas-adjusts the score.",
+  "license": "MIT",
+  "author": "Slipless Labs",
+  "homepage": "https://slipless.xyz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/slipless-dex/smart-order-router.git"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "engines": { "node": ">=18.17" },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "viem": "^2.21.0"
+  },
+  "dependencies": {
+    "@slipless/sdk": "^0.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.2",
+    "viem": "^2.21.0",
+    "vitest": "^2.1.2"
+  },
+  "keywords": ["slipless", "smart-order-router", "sor", "dex", "amm", "perpetuals"]
+}
