@@ -1,17 +1,9 @@
-/**
- * Token graph. Each undirected edge is a pool; each node is a token.
- *
- * The graph stores pools indexed by token-pair so the pathfinder can
- * iterate neighbours in O(deg). We pre-sort each adjacency list by
- * descending liquidityScore so DFS visits high-quality pools first; this
- * is what makes branch-and-bound termination fast in practice.
- */
-
 import type { Pool, TokenAddress } from "./types.js";
 
+interface Edge { pool: Pool; other: TokenAddress }
+
 export class TokenGraph {
-  /** token → list of (pool, otherToken) sorted by liquidity. */
-  private readonly adj = new Map<TokenAddress, Array<{ pool: Pool; other: TokenAddress }>>();
+  private readonly adj = new Map<string, Edge[]>();
 
   constructor(pools: readonly Pool[]) {
     for (const pool of pools) {
@@ -19,7 +11,7 @@ export class TokenGraph {
       this.push(a, pool, b);
       this.push(b, pool, a);
     }
-    // Sort once.
+    // High-liquidity neighbours first → DFS prunes faster.
     for (const list of this.adj.values()) {
       list.sort((x, y) => {
         const lx = x.pool.liquidityScore();
@@ -29,16 +21,16 @@ export class TokenGraph {
     }
   }
 
-  neighbours(token: TokenAddress): ReadonlyArray<{ pool: Pool; other: TokenAddress }> {
-    return this.adj.get(token.toLowerCase() as TokenAddress) ?? [];
+  neighbours(token: TokenAddress): ReadonlyArray<Edge> {
+    return this.adj.get(token.toLowerCase()) ?? [];
   }
 
   has(token: TokenAddress): boolean {
-    return this.adj.has(token.toLowerCase() as TokenAddress);
+    return this.adj.has(token.toLowerCase());
   }
 
   private push(token: TokenAddress, pool: Pool, other: TokenAddress): void {
-    const key = token.toLowerCase() as TokenAddress;
+    const key = token.toLowerCase();
     let list = this.adj.get(key);
     if (!list) {
       list = [];

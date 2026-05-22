@@ -1,34 +1,26 @@
-/**
- * Constant-product pool (UniswapV2-style).
- *
- *     y_out = y - k / (x + dx*(1 - fee))
- *           = y * dx*(1 - fee) / (x + dx*(1 - fee))
- *
- * Fee is in basis points (e.g. 30 = 0.30%). Math is fully exact when the
- * reserves stay below 2^96 — which gives us roughly 8.4e28 base units of
- * headroom, far above any real pool.
- */
+// y_out = y * dx * (1 - fee) / (x + dx * (1 - fee))
 
 import type { Pool, Quote, TokenAddress } from "../types.js";
 
 export interface V2PoolConfig {
   id: string;
   tokens: readonly [TokenAddress, TokenAddress];
-  /** Reserves match `tokens` in order. */
   reserves: readonly [bigint, bigint];
-  /** Fee in basis points; e.g. 30 = 0.30%. */
+  /** Basis points. 30 = 0.30%. */
   feeBps: number;
 }
 
 const ONE_E18 = 10n ** 18n;
-const BPS_DENOM = 10_000n;
+const BPS = 10_000n;
 
 export class V2Pool implements Pool {
   readonly kind = "v2" as const;
   readonly id: string;
   readonly tokens: readonly [TokenAddress, TokenAddress];
   readonly feeBps: number;
+  private readonly token0Lower: string;
   private readonly reserves: [bigint, bigint];
+  private cachedLiquidity?: bigint;
 
   constructor(cfg: V2PoolConfig) {
     if (cfg.reserves[0] <= 0n || cfg.reserves[1] <= 0n) {
@@ -37,47 +29,39 @@ export class V2Pool implements Pool {
     this.id = cfg.id;
     this.tokens = cfg.tokens;
     this.feeBps = cfg.feeBps;
+    this.token0Lower = cfg.tokens[0].toLowerCase();
     this.reserves = [cfg.reserves[0], cfg.reserves[1]];
   }
 
   liquidityScore(): bigint {
-    // sqrt(x*y) is the canonical V2 liquidity proxy.
-    return sqrtBig(this.reserves[0] * this.reserves[1]);
+    if (this.cachedLiquidity !== undefined) return this.cachedLiquidity;
+    this.cachedLiquidity = sqrtBig(this.reserves[0] * this.reserves[1]);
+    return this.cachedLiquidity;
   }
 
   quoteExactIn(tokenIn: TokenAddress, amountIn: bigint): Quote {
-    if (amountIn <= 0n) {
-      return { amountIn: 0n, amountOut: 0n, midPriceAfter: 0n };
-    }
-    const inFirst = this.tokens[0].toLowerCase() === tokenIn.toLowerCase();
+    if (amountIn <= 0n) return { amountIn: 0n, amountOut: 0n, midPriceAfter: 0n };
+
+    const inFirst = this.token0Lower === tokenIn.toLowerCase();
     if (!inFirst && this.tokens[1].toLowerCase() !== tokenIn.toLowerCase()) {
-      throw new Error(`V2Pool ${this.id}: token ${tokenIn} not in pool`);
+      throw new Error(`V2Pool ${this.id}: ${tokenIn} not in pool`);
     }
-    const [reserveIn, reserveOut] = inFirst
-      ? [this.reserves[0], this.reserves[1]]
-      : [this.reserves[1], this.reserves[0]];
+    const reserveIn = inFirst ? this.reserves[0] : this.reserves[1];
+    const reserveOut = inFirst ? this.reserves[1] : this.reserves[0];
 
-    // Apply fee on the input side.
-    const inAfterFee = amountIn * (BPS_DENOM - BigInt(this.feeBps));
-    const numerator = inAfterFee * reserveOut;
-    const denominator = reserveIn * BPS_DENOM + inAfterFee;
-    const amountOut = numerator / denominator;
+    const inAfterFee = amountIn * (BPS - BigInt(this.feeBps));
+    const amountOut = (inAfterFee * reserveOut) / (reserveIn * BPS + inAfterFee);
 
-    // Marginal price after the trade (output per input, 1e18 fp).
-    const newReserveIn = reserveIn + amountIn;
-    const newReserveOut = reserveOut - amountOut;
-    const midPriceAfter = newReserveIn === 0n
-      ? 0n
-      : (newReserveOut * ONE_E18) / newReserveIn;
+    const newIn = reserveIn + amountIn;
+    const newOut = reserveOut - amountOut;
+    const midPriceAfter = newIn === 0n ? 0n : (newOut * ONE_E18) / newIn;
 
     return { amountIn, amountOut, midPriceAfter };
   }
 }
 
-/** Babylonian sqrt for bigint. Used only for liquidity scoring. */
 function sqrtBig(value: bigint): bigint {
-  if (value < 0n) throw new Error("sqrtBig: negative");
-  if (value < 2n) return value;
+  if (value < 2n) return value < 0n ? 0n : value;
   let x0 = value;
   let x1 = (value >> 1n) + 1n;
   while (x1 < x0) {

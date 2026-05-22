@@ -1,42 +1,27 @@
-/**
- * Concentrated-liquidity pool (UniswapV3-style).
- *
- *     price = (sqrtPriceX96 / 2^96)^2     (token1/token0)
- *     L     = liquidity active at the current tick
- *
- * Swapping crosses ticks: each tick may add/remove `liquidityNet`. Inside a
- * single tick, the relationship between sqrtPrice and reserves is
- *
- *     ΔX = L * (1/sqrtP_lo - 1/sqrtP_hi)
- *     ΔY = L * (sqrtP_hi - sqrtP_lo)
- *
- * We implement only the parts the SOR needs to quote a single-pool swap.
- * No collected-fees, no protocol fees, no overflow checks beyond what the
- * algorithm requires — keep this auditable. For execution the integrator
- * calls the on-chain quoter; this is for *path selection*.
- */
+// V3 concentrated liquidity, single-pool. SOR scope only — execution uses
+// the on-chain quoter. Tick math here is float-based (Taylor expansion);
+// relative error ~1e-6, fine for path selection.
 
 import type { Pool, Quote, TokenAddress } from "../types.js";
 
 const Q96 = 1n << 96n;
 const ONE_E18 = 10n ** 18n;
+const LN_1_0001 = 0.00009999500033330834;
 
 export interface V3Tick {
-  /** Tick index. Must be a multiple of `tickSpacing`. */
   index: number;
-  /** Net liquidity that activates when crossing left-to-right; `liquidityNet`. */
   liquidityNet: bigint;
 }
 
 export interface V3PoolConfig {
   id: string;
   tokens: readonly [TokenAddress, TokenAddress];
-  feeBps: number;          // e.g. 5 = 0.05%
+  feeBps: number;
   tickSpacing: number;
-  sqrtPriceX96: bigint;    // current price
-  liquidity: bigint;       // active L
-  tick: number;            // current tick
-  /** Sorted ascending by index, including the current tick if liquidityNet ≠ 0. */
+  sqrtPriceX96: bigint;
+  liquidity: bigint;
+  tick: number;
+  /** Ascending by index. */
   ticks: readonly V3Tick[];
 }
 
@@ -47,105 +32,88 @@ export class V3Pool implements Pool {
   readonly feeBps: number;
   readonly tickSpacing: number;
 
-  private sqrtPriceX96: bigint;
-  private liquidity: bigint;
-  private tick: number;
-  private readonly ticks: V3Tick[];
+  private readonly token0Lower: string;
+  private readonly sqrtPriceX96: bigint;
+  private readonly liquidity: bigint;
+  private readonly tick: number;
+  private readonly ticks: readonly V3Tick[];
 
   constructor(cfg: V3PoolConfig) {
     this.id = cfg.id;
     this.tokens = cfg.tokens;
     this.feeBps = cfg.feeBps;
     this.tickSpacing = cfg.tickSpacing;
+    this.token0Lower = cfg.tokens[0].toLowerCase();
     this.sqrtPriceX96 = cfg.sqrtPriceX96;
     this.liquidity = cfg.liquidity;
     this.tick = cfg.tick;
-    this.ticks = [...cfg.ticks];
+    this.ticks = cfg.ticks;
   }
 
   liquidityScore(): bigint {
-    // Use *current* L scaled by sqrt-price as a rough notional.
-    const sqrtP = this.sqrtPriceX96;
-    return (this.liquidity * sqrtP) / Q96;
+    return (this.liquidity * this.sqrtPriceX96) / Q96;
   }
 
   quoteExactIn(tokenIn: TokenAddress, amountIn: bigint): Quote {
     if (amountIn <= 0n) return { amountIn: 0n, amountOut: 0n, midPriceAfter: 0n };
 
-    const zeroForOne = tokenIn.toLowerCase() === this.tokens[0].toLowerCase();
+    const zeroForOne = tokenIn.toLowerCase() === this.token0Lower;
     if (!zeroForOne && tokenIn.toLowerCase() !== this.tokens[1].toLowerCase()) {
-      throw new Error(`V3Pool ${this.id}: token ${tokenIn} not in pool`);
+      throw new Error(`V3Pool ${this.id}: ${tokenIn} not in pool`);
     }
 
-    // Snapshot — quoting must not mutate.
     let sqrtPriceX96 = this.sqrtPriceX96;
     let liquidity = this.liquidity;
-    let tickIdx = this.indexOfActiveTick();
+    let tickIdx = this.activeTickIndex();
+    let remaining = amountIn;
+    let out = 0n;
 
-    let amountRemaining = amountIn;
-    let amountOut = 0n;
-
-    const feeBps = BigInt(this.feeBps);
+    const fee = BigInt(this.feeBps);
     let safety = 0;
 
-    while (amountRemaining > 0n && liquidity > 0n) {
-      if (++safety > 1024) break; // pathological pools — fail soft.
+    while (remaining > 0n && liquidity > 0n && safety++ < 1024) {
+      const next = zeroForOne ? this.ticks[tickIdx] : this.ticks[tickIdx + 1];
+      if (!next) break;
+      const sqrtTarget = tickToSqrtPriceX96(next.index);
 
-      const nextTick = zeroForOne
-        ? this.previousTick(tickIdx)
-        : this.nextTick(tickIdx);
-      if (!nextTick) break;
+      const step = computeStep({
+        sqrtCurrent: sqrtPriceX96,
+        sqrtTarget,
+        liquidity,
+        remaining,
+        zeroForOne,
+        feeBps: fee,
+      });
 
-      const sqrtPriceNextX96 = tickToSqrtPriceX96(nextTick.index);
+      remaining -= step.amountIn;
+      out += step.amountOut;
+      sqrtPriceX96 = step.sqrtAfter;
 
-      // Step within the current tick: how much amountIn does the full
-      // step consume, and how much amountOut does it yield?
-      const { amountInStep, amountOutStep, sqrtPriceAfter, exhausted } =
-        computeStep({
-          sqrtPriceCurrentX96: sqrtPriceX96,
-          sqrtPriceTargetX96: sqrtPriceNextX96,
-          liquidity,
-          amountInRemaining: amountRemaining,
-          zeroForOne,
-          feeBps,
-        });
+      if (!step.exhausted) break;
 
-      amountRemaining -= amountInStep;
-      amountOut += amountOutStep;
-      sqrtPriceX96 = sqrtPriceAfter;
-
-      if (exhausted) {
-        // Cross the tick: update active liquidity.
-        if (zeroForOne) {
-          liquidity -= nextTick.liquidityNet;
-          tickIdx = this.indexOfTick(nextTick.index) - 1;
-        } else {
-          liquidity += nextTick.liquidityNet;
-          tickIdx = this.indexOfTick(nextTick.index);
-        }
+      if (zeroForOne) {
+        liquidity -= next.liquidityNet;
+        tickIdx = indexOf(this.ticks, next.index) - 1;
       } else {
-        break; // step ran out of amountIn before reaching the next tick.
+        liquidity += next.liquidityNet;
+        tickIdx = indexOf(this.ticks, next.index);
       }
     }
 
-    // Marginal price after, expressed in tokenOut/tokenIn 1e18 fp.
-    const priceAfter = (sqrtPriceX96 * sqrtPriceX96) / Q96; // *2^96 / 2^96 net; readability comment below.
+    // mid = (sqrtP / 2^96)^2 in tokenOut/tokenIn 1e18 fp
+    const priceAfter = (sqrtPriceX96 * sqrtPriceX96) / Q96;
     const midPriceAfter = zeroForOne
-      ? (priceAfter * ONE_E18) / Q96 // token1/token0
-      : (Q96 * ONE_E18) / priceAfter; // invert for token0/token1
+      ? (priceAfter * ONE_E18) / Q96
+      : priceAfter === 0n ? 0n : (Q96 * ONE_E18) / priceAfter;
 
-    return {
-      amountIn: amountIn - amountRemaining,
-      amountOut,
-      midPriceAfter,
-    };
+    return { amountIn: amountIn - remaining, amountOut: out, midPriceAfter };
   }
 
-  private indexOfActiveTick(): number {
-    // Index into `ticks` of the largest tick ≤ current tick.
+  /** Largest tick ≤ current. -1 if no ticks. */
+  private activeTickIndex(): number {
+    if (this.ticks.length === 0) return -1;
     let lo = 0;
     let hi = this.ticks.length - 1;
-    if (hi < 0) return -1;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
       if (this.ticks[mid]!.index <= this.tick) lo = mid;
@@ -153,121 +121,77 @@ export class V3Pool implements Pool {
     }
     return lo;
   }
-
-  private indexOfTick(index: number): number {
-    return this.ticks.findIndex((t) => t.index === index);
-  }
-
-  private previousTick(fromIndex: number): V3Tick | undefined {
-    return this.ticks[fromIndex];
-  }
-  private nextTick(fromIndex: number): V3Tick | undefined {
-    return this.ticks[fromIndex + 1];
-  }
 }
 
 interface StepInputs {
-  sqrtPriceCurrentX96: bigint;
-  sqrtPriceTargetX96: bigint;
+  sqrtCurrent: bigint;
+  sqrtTarget: bigint;
   liquidity: bigint;
-  amountInRemaining: bigint;
+  remaining: bigint;
   zeroForOne: boolean;
   feeBps: bigint;
 }
 
 interface StepOutputs {
-  amountInStep: bigint;
-  amountOutStep: bigint;
-  sqrtPriceAfter: bigint;
-  /** True iff the step consumed all the way to the target. */
+  amountIn: bigint;
+  amountOut: bigint;
+  sqrtAfter: bigint;
   exhausted: boolean;
 }
 
-/**
- * Walk a single tick. Closed-form math; cribbed from the V3 white paper
- * §6 with fee applied on the input side as `amountIn * (1 - feeBps)`.
- */
 function computeStep(s: StepInputs): StepOutputs {
-  const inAfterFee = (s.amountInRemaining * (10_000n - s.feeBps)) / 10_000n;
+  const inAfterFee = (s.remaining * (10_000n - s.feeBps)) / 10_000n;
+  const inToTarget = s.zeroForOne
+    ? amount0Delta(s.sqrtTarget, s.sqrtCurrent, s.liquidity)
+    : amount1Delta(s.sqrtCurrent, s.sqrtTarget, s.liquidity);
 
-  // Amount needed to move sqrtPrice fully from current → target.
-  const amountInToReachTarget = s.zeroForOne
-    ? amount0Delta(s.sqrtPriceTargetX96, s.sqrtPriceCurrentX96, s.liquidity)
-    : amount1Delta(s.sqrtPriceCurrentX96, s.sqrtPriceTargetX96, s.liquidity);
-
-  if (inAfterFee >= amountInToReachTarget) {
-    // Full step: exhaust to the target.
-    const amountOutStep = s.zeroForOne
-      ? amount1Delta(s.sqrtPriceTargetX96, s.sqrtPriceCurrentX96, s.liquidity)
-      : amount0Delta(s.sqrtPriceCurrentX96, s.sqrtPriceTargetX96, s.liquidity);
-    // Pre-fee equivalent of the consumed input.
-    const amountInStep = (amountInToReachTarget * 10_000n) / (10_000n - s.feeBps) + 1n;
+  if (inAfterFee >= inToTarget) {
+    const outStep = s.zeroForOne
+      ? amount1Delta(s.sqrtTarget, s.sqrtCurrent, s.liquidity)
+      : amount0Delta(s.sqrtCurrent, s.sqrtTarget, s.liquidity);
+    const inStep = (inToTarget * 10_000n) / (10_000n - s.feeBps) + 1n;
     return {
-      amountInStep: amountInStep > s.amountInRemaining ? s.amountInRemaining : amountInStep,
-      amountOutStep,
-      sqrtPriceAfter: s.sqrtPriceTargetX96,
+      amountIn: inStep > s.remaining ? s.remaining : inStep,
+      amountOut: outStep,
+      sqrtAfter: s.sqrtTarget,
       exhausted: true,
     };
   }
 
-  // Partial step: solve for the new sqrtPrice that absorbs `inAfterFee`.
-  const sqrtPriceAfter = s.zeroForOne
-    ? nextSqrtPriceFromInput0(s.sqrtPriceCurrentX96, s.liquidity, inAfterFee)
-    : nextSqrtPriceFromInput1(s.sqrtPriceCurrentX96, s.liquidity, inAfterFee);
-  const amountOutStep = s.zeroForOne
-    ? amount1Delta(sqrtPriceAfter, s.sqrtPriceCurrentX96, s.liquidity)
-    : amount0Delta(s.sqrtPriceCurrentX96, sqrtPriceAfter, s.liquidity);
-  return {
-    amountInStep: s.amountInRemaining,
-    amountOutStep,
-    sqrtPriceAfter,
-    exhausted: false,
-  };
+  const sqrtAfter = s.zeroForOne
+    ? nextSqrtPriceFromInput0(s.sqrtCurrent, s.liquidity, inAfterFee)
+    : nextSqrtPriceFromInput1(s.sqrtCurrent, s.liquidity, inAfterFee);
+  const outStep = s.zeroForOne
+    ? amount1Delta(sqrtAfter, s.sqrtCurrent, s.liquidity)
+    : amount0Delta(s.sqrtCurrent, sqrtAfter, s.liquidity);
+  return { amountIn: s.remaining, amountOut: outStep, sqrtAfter, exhausted: false };
 }
 
-/** ΔX in token0 between two sqrt-prices (lo < hi). Always positive. */
-function amount0Delta(sqrtLoX96: bigint, sqrtHiX96: bigint, L: bigint): bigint {
-  if (sqrtLoX96 === 0n || sqrtHiX96 === 0n) return 0n;
-  const num = (L << 96n) * (sqrtHiX96 - sqrtLoX96);
-  const den = sqrtHiX96 * sqrtLoX96;
-  return num / den;
+function amount0Delta(lo: bigint, hi: bigint, L: bigint): bigint {
+  if (lo === 0n || hi === 0n) return 0n;
+  return ((L << 96n) * (hi - lo)) / (hi * lo);
 }
 
-/** ΔY in token1 between two sqrt-prices (lo < hi). Always positive. */
-function amount1Delta(sqrtLoX96: bigint, sqrtHiX96: bigint, L: bigint): bigint {
-  return (L * (sqrtHiX96 - sqrtLoX96)) / Q96;
+function amount1Delta(lo: bigint, hi: bigint, L: bigint): bigint {
+  return (L * (hi - lo)) / Q96;
 }
 
-/** Solve for sqrtPrice after consuming `amount` of token0. */
-function nextSqrtPriceFromInput0(sqrtPX96: bigint, L: bigint, amountIn: bigint): bigint {
-  // sqrtP_new = L * sqrtP / (L + amountIn * sqrtP / 2^96)
-  const numerator = L * sqrtPX96;
-  const denominator = L + (amountIn * sqrtPX96) / Q96;
-  return numerator / denominator;
+function nextSqrtPriceFromInput0(sqrtP: bigint, L: bigint, amount: bigint): bigint {
+  return (L * sqrtP) / (L + (amount * sqrtP) / Q96);
 }
 
-/** Solve for sqrtPrice after consuming `amount` of token1. */
-function nextSqrtPriceFromInput1(sqrtPX96: bigint, L: bigint, amountIn: bigint): bigint {
-  // sqrtP_new = sqrtP + amountIn * 2^96 / L
-  return sqrtPX96 + (amountIn * Q96) / L;
+function nextSqrtPriceFromInput1(sqrtP: bigint, L: bigint, amount: bigint): bigint {
+  return sqrtP + (amount * Q96) / L;
 }
 
-/**
- * Compute sqrtPriceX96 for a given tick. Lossy for our purposes — we use
- * the Taylor series around 1.0001^(tick/2) good to ~1e-6 relative error,
- * which is more than sufficient for path selection.
- *
- * For execution, callers must use the on-chain TickMath.getSqrtRatioAtTick.
- */
 function tickToSqrtPriceX96(tick: number): bigint {
-  // 1.0001^(tick/2) ≈ exp(tick * ln(1.0001) / 2)
-  const ln10001 = 0.00009999500033330834; // ln(1.0001)
-  const sqrt = Math.exp((tick * ln10001) / 2);
-  // Multiply by 2^96 with Math.* care; 2^96 ≈ 7.92e28.
-  const Q = Number(Q96);
-  const scaled = sqrt * Q;
-  if (!Number.isFinite(scaled)) {
-    throw new Error(`tickToSqrtPriceX96: tick ${tick} out of range`);
-  }
+  const sqrt = Math.exp((tick * LN_1_0001) / 2);
+  const scaled = sqrt * Number(Q96);
+  if (!Number.isFinite(scaled)) throw new Error(`tickToSqrtPriceX96: tick ${tick} out of range`);
   return BigInt(Math.floor(scaled));
+}
+
+function indexOf(ticks: readonly V3Tick[], index: number): number {
+  for (let i = 0; i < ticks.length; i++) if (ticks[i]!.index === index) return i;
+  return -1;
 }

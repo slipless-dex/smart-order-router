@@ -1,19 +1,4 @@
-/**
- * DFS with branch-and-bound to enumerate the top-N routes between two
- * tokens. Bound = best amountOut seen so far; prune any partial path whose
- * upper-bound (current amountOut * best-marginal-price further) cannot beat
- * the worst entry in the result heap.
- *
- * In practice maxHops ≤ 4 is plenty; higher just blows up combinatorially.
- */
-
-import type {
-  Pool,
-  Route,
-  RouteHop,
-  SearchParams,
-  TokenAddress,
-} from "./types.js";
+import type { Pool, Route, RouteHop, SearchParams, TokenAddress } from "./types.js";
 import type { TokenGraph } from "./graph.js";
 
 interface Candidate {
@@ -40,52 +25,42 @@ export function findRoutes(
   const results: Candidate[] = [];
   const visitedPools = new Set<string>();
 
-  const visit = (
-    current: TokenAddress,
-    runningAmount: bigint,
-    hops: RouteHop[],
-  ): void => {
-    if (Date.now() > deadline) return;
-    if (hops.length >= params.maxHops) return;
+  function visit(current: TokenAddress, runningAmount: bigint, hops: RouteHop[]): void {
+    if (Date.now() > deadline || hops.length >= params.maxHops) return;
 
     for (const { pool, other } of graph.neighbours(current)) {
-      if (visitedPools.has(pool.id)) continue; // never use the same pool twice
+      if (visitedPools.has(pool.id)) continue;
       const quote = safeQuote(pool, current, runningAmount);
       if (quote.amountOut <= 0n) continue;
+
+      const otherLower = other.toLowerCase() as TokenAddress;
       const nextHops = [...hops, { pool, tokenIn: current, tokenOut: other }];
       visitedPools.add(pool.id);
-      try {
-        if (other.toLowerCase() === target.toLowerCase()) {
-          insertCandidate(results, {
-            route: { hops: nextHops, inputToken: start, outputToken: target },
-            amountOut: quote.amountOut,
-          }, params.maxRoutes);
-        } else {
-          visit(other.toLowerCase() as TokenAddress, quote.amountOut, nextHops);
-        }
-      } finally {
-        visitedPools.delete(pool.id);
+      if (otherLower === target) {
+        insertCandidate(
+          results,
+          { route: { hops: nextHops, inputToken: start, outputToken: target }, amountOut: quote.amountOut },
+          params.maxRoutes,
+        );
+      } else {
+        visit(otherLower, quote.amountOut, nextHops);
       }
+      visitedPools.delete(pool.id);
     }
-  };
+  }
 
   visit(start, amountIn, []);
-  return results
-    .sort((a, b) => (a.amountOut > b.amountOut ? -1 : a.amountOut < b.amountOut ? 1 : 0))
-    .slice(0, params.maxRoutes)
-    .map((c) => c.route);
+  results.sort((a, b) => (a.amountOut > b.amountOut ? -1 : a.amountOut < b.amountOut ? 1 : 0));
+  return results.slice(0, params.maxRoutes).map((c) => c.route);
 }
 
 function safeQuote(pool: Pool, tokenIn: TokenAddress, amountIn: bigint) {
-  try {
-    return pool.quoteExactIn(tokenIn, amountIn);
-  } catch {
-    return { amountIn: 0n, amountOut: 0n, midPriceAfter: 0n };
-  }
+  try { return pool.quoteExactIn(tokenIn, amountIn); }
+  catch { return { amountIn: 0n, amountOut: 0n, midPriceAfter: 0n }; }
 }
 
+/** Linear scan: maxRoutes is small (~8). Heap not worth it. */
 function insertCandidate(arr: Candidate[], c: Candidate, cap: number): void {
-  // Maintain best-N by amountOut. cap is small so a linear scan beats a heap.
   if (arr.length < cap) {
     arr.push(c);
     return;

@@ -1,8 +1,3 @@
-/**
- * Top-level smart-order router. Composes the graph, pathfinder, quote,
- * splits, and cache into a single `quote()` entrypoint.
- */
-
 import type {
   Pool,
   Route,
@@ -20,9 +15,7 @@ import { LruTtlCache } from "./cache.js";
 
 export interface SmartOrderRouterOptions {
   pools: readonly Pool[];
-  /** Cache routes for this many ms; default 2 000. */
   cacheTtlMs?: number;
-  /** Max distinct (in,out,amountBucket) entries to cache; default 1 024. */
   cacheCapacity?: number;
 }
 
@@ -30,20 +23,15 @@ export interface QuoteRequest {
   tokenIn: TokenAddress;
   tokenOut: TokenAddress;
   amountIn: bigint;
-  /** Splitting on/off (default true, ≥2 routes). */
   enableSplits?: boolean;
   search?: Partial<SearchParams>;
   context: RouterContext;
 }
 
 export interface QuoteResponse {
-  /** Best single route, regardless of split decision. */
   best: RouteQuote;
-  /** Alternative routes considered (sorted by netOut, descending). */
   alternatives: RouteQuote[];
-  /** Multi-route split, if enabled and beneficial; otherwise undefined. */
   split?: SplitQuote;
-  /** Whatever wins on `netOut` is reported here. Just look at this in UI. */
   recommended: RouteQuote | SplitQuote;
 }
 
@@ -53,10 +41,7 @@ export class SmartOrderRouter {
 
   constructor(opts: SmartOrderRouterOptions) {
     this.graph = new TokenGraph(opts.pools);
-    this.cache = new LruTtlCache(
-      opts.cacheCapacity ?? 1024,
-      opts.cacheTtlMs ?? 2_000,
-    );
+    this.cache = new LruTtlCache(opts.cacheCapacity ?? 1024, opts.cacheTtlMs ?? 2_000);
   }
 
   quote(req: QuoteRequest): QuoteResponse {
@@ -72,30 +57,15 @@ export class SmartOrderRouter {
       }),
     };
 
-    const routes = findRoutes(
-      this.graph,
-      req.tokenIn,
-      req.tokenOut,
-      req.amountIn,
-      params,
-    );
-
-    if (routes.length === 0) {
-      const empty = emptyResponse(req);
-      this.cache.set(cacheKey, empty);
-      return empty;
-    }
+    const routes = findRoutes(this.graph, req.tokenIn, req.tokenOut, req.amountIn, params);
+    if (routes.length === 0) return this.cacheAndReturn(cacheKey, emptyResponse(req));
 
     const quotes = routes
       .map((r) => quoteRoute(r, req.amountIn, req.context))
       .filter((q) => q.amountOut > 0n)
       .sort((a, b) => (a.netOut > b.netOut ? -1 : a.netOut < b.netOut ? 1 : 0));
 
-    if (quotes.length === 0) {
-      const empty = emptyResponse(req);
-      this.cache.set(cacheKey, empty);
-      return empty;
-    }
+    if (quotes.length === 0) return this.cacheAndReturn(cacheKey, emptyResponse(req));
 
     const best = quotes[0]!;
     const alternatives = quotes.slice(1);
@@ -110,31 +80,30 @@ export class SmartOrderRouter {
       if (trial.netOut > best.netOut) split = trial;
     }
 
-    const recommended: RouteQuote | SplitQuote = split ?? best;
     const response: QuoteResponse = {
       best,
       alternatives,
       ...(split !== undefined && { split }),
-      recommended,
+      recommended: split ?? best,
     };
-    this.cache.set(cacheKey, response);
-    return response;
+    return this.cacheAndReturn(cacheKey, response);
   }
 
+  /** Bucket amount by 0.1% so neighbouring requests hit the cache. */
   private cacheKey(req: QuoteRequest): string {
-    // Bucket the amount by 0.1% so adjacent requests hit the cache.
     const bucketed = (req.amountIn / 1000n) * 1000n;
-    return `${req.tokenIn.toLowerCase()}|${req.tokenOut.toLowerCase()}|${bucketed.toString()}`;
+    return `${req.tokenIn.toLowerCase()}|${req.tokenOut.toLowerCase()}|${bucketed}`;
+  }
+
+  private cacheAndReturn(key: string, response: QuoteResponse): QuoteResponse {
+    this.cache.set(key, response);
+    return response;
   }
 }
 
 function emptyResponse(req: QuoteRequest): QuoteResponse {
   const empty: RouteQuote = {
-    route: {
-      hops: [],
-      inputToken: req.tokenIn,
-      outputToken: req.tokenOut,
-    },
+    route: { hops: [], inputToken: req.tokenIn, outputToken: req.tokenOut },
     amountIn: req.amountIn,
     amountOut: 0n,
     gasEstimate: 0n,

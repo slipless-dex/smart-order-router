@@ -1,8 +1,3 @@
-/**
- * Take a discovered Route and compute its end-to-end quote, including
- * gas-adjusted score in `outputToken` units.
- */
-
 import type {
   Pool,
   Quote,
@@ -13,16 +8,10 @@ import type {
   TokenAddress,
 } from "./types.js";
 
-const BASE_OVERHEAD_GAS = 60_000n; // call into LimitOrderProtocol etc.
+const BASE_OVERHEAD_GAS = 60_000n;
 
-export function quoteRoute(
-  route: Route,
-  amountIn: bigint,
-  ctx: RouterContext,
-): RouteQuote {
-  if (route.hops.length === 0) {
-    throw new Error("quoteRoute: empty route");
-  }
+export function quoteRoute(route: Route, amountIn: bigint, ctx: RouterContext): RouteQuote {
+  if (route.hops.length === 0) throw new Error("quoteRoute: empty route");
 
   const perHop: Quote[] = [];
   let cur = amountIn;
@@ -32,57 +21,42 @@ export function quoteRoute(
   for (const hop of route.hops) {
     const q = hop.pool.quoteExactIn(activeIn, cur);
     perHop.push(q);
-    if (q.amountOut === 0n) {
-      // Path failed mid-way; surface a zero quote.
-      return zeroQuote(route, amountIn, ctx);
-    }
+    if (q.amountOut === 0n) return zeroQuote(route, amountIn);
     cur = q.amountOut;
     activeIn = hop.tokenOut;
-    gas += hopGasFor(hop) + (q.gasEstimate ?? 0n);
+    gas += hopGas(hop) + (q.gasEstimate ?? 0n);
   }
 
-  const netOut = applyGasAdjustment(cur, gas, ctx);
   return {
     route,
     amountIn,
     amountOut: cur,
     gasEstimate: gas,
-    netOut,
+    netOut: applyGasAdjustment(cur, gas, ctx),
     perHop,
   };
 }
 
-/**
- * Subtract the gas cost (denominated in outputToken units) from amountOut.
- * Done in floating-point because gas-cost approximation doesn't need
- * sub-wei precision; the truncation back to bigint keeps balances exact.
- */
-export function applyGasAdjustment(
-  amountOut: bigint,
-  gasEstimate: bigint,
-  ctx: RouterContext,
-): bigint {
-  if (ctx.gasPriceWei === 0n || gasEstimate === 0n) return amountOut;
-  const gasUsdNum = Number(gasEstimate) * Number(ctx.gasPriceWei) * ctx.gasTokenPriceUsd / 1e18;
-  if (!Number.isFinite(gasUsdNum) || ctx.outputTokenPriceUsd === 0) return amountOut;
-  const gasInOutputUnitsNum = (gasUsdNum / ctx.outputTokenPriceUsd) * 10 ** ctx.outputTokenDecimals;
-  if (!Number.isFinite(gasInOutputUnitsNum)) return amountOut;
-  const gasInOutputUnits = BigInt(Math.floor(Math.max(0, gasInOutputUnitsNum)));
-  return amountOut > gasInOutputUnits ? amountOut - gasInOutputUnits : 0n;
+/** Floats here because sub-wei precision in gas estimation is meaningless. */
+export function applyGasAdjustment(amountOut: bigint, gas: bigint, ctx: RouterContext): bigint {
+  if (ctx.gasPriceWei === 0n || gas === 0n || ctx.outputTokenPriceUsd === 0) return amountOut;
+  const gasUsd = (Number(gas) * Number(ctx.gasPriceWei) * ctx.gasTokenPriceUsd) / 1e18;
+  if (!Number.isFinite(gasUsd)) return amountOut;
+  const inOut = (gasUsd / ctx.outputTokenPriceUsd) * 10 ** ctx.outputTokenDecimals;
+  if (!Number.isFinite(inOut)) return amountOut;
+  const cost = BigInt(Math.floor(Math.max(0, inOut)));
+  return amountOut > cost ? amountOut - cost : 0n;
 }
 
-function hopGasFor(hop: RouteHop): bigint {
+function hopGas(hop: RouteHop): bigint {
   switch (hop.pool.kind) {
-    case "v2":
-      return 60_000n;
-    case "v3":
-      return 90_000n; // ticks may cross; this is the typical case.
-    case "perp":
-      return 150_000n; // settlement is heavier.
+    case "v2":   return 60_000n;
+    case "v3":   return 90_000n;
+    case "perp": return 150_000n;
   }
 }
 
-function zeroQuote(route: Route, amountIn: bigint, _ctx: RouterContext): RouteQuote {
+function zeroQuote(route: Route, amountIn: bigint): RouteQuote {
   return {
     route,
     amountIn,
@@ -93,7 +67,6 @@ function zeroQuote(route: Route, amountIn: bigint, _ctx: RouterContext): RouteQu
   };
 }
 
-/** Helper used by tests / debug: route description. */
 export function describeRoute(route: Route, poolName?: (p: Pool) => string): string {
   const parts: string[] = [route.inputToken.slice(0, 6)];
   for (const hop of route.hops) {

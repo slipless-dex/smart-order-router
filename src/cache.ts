@@ -1,8 +1,3 @@
-/**
- * Tiny LRU + TTL cache. Used to memoise routes between identical requests
- * within the same block; 1-3 second TTL is appropriate for L2s.
- */
-
 interface Entry<V> {
   value: V;
   expiresAt: number;
